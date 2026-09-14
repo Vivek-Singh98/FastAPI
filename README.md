@@ -1,5 +1,132 @@
-# FastAPI
 
+# FastAPI Interview Notes
+
+Use this guide to explain concepts aloud, then demonstrate them with [main.py](main.py). Examples use Pydantic v2. This covers the main interview areas, rather than every framework feature.
+
+## 1. What is FastAPI?
+
+FastAPI is a Python framework for building APIs with type-driven request parsing, validation, serialization, and generated OpenAPI documentation. Starlette provides web/ASGI capabilities; Pydantic handles data models. Uvicorn is an ASGI server that runs the application.
+
+**Interview answer:** “I define typed endpoint functions and models. FastAPI uses them to validate incoming requests and generate an API contract. I still design the business rules, storage, and authorization.”
+
+ASGI supports asynchronous request handling and protocols such as WebSockets. WSGI is the older synchronous application-server interface. An ASGI framework does not automatically make blocking libraries asynchronous. [FastAPI introduction](https://fastapi.tiangolo.com/)
+
+## 2. Routing and request parameters
+
+```python
+from typing import Annotated
+from fastapi import FastAPI, Header, Path, Query
+
+app = FastAPI()
+
+@app.get("/items/{item_id}")
+def read_item(
+    item_id: Annotated[int, Path(gt=0)],
+    q: Annotated[str | None, Query(max_length=50)] = None,
+    user_agent: Annotated[str | None, Header()] = None,
+):
+    return {"item_id": item_id, "q": q, "user_agent": user_agent}
+```
+
+| Input | Example | Declaration |
+| --- | --- | --- |
+| Path | `/items/7` | Parameter matching `{item_id}` |
+| Query | `?q=python` | Scalar parameter / `Query` |
+| JSON body | `{"title":"Study"}` | Pydantic model / `Body` |
+| Header | `User-Agent: ...` | `Header` |
+| Cookie | Session cookie | `Cookie` |
+| Form | Form submission | `Form` |
+| File | Multipart upload | `UploadFile` / `File` |
+
+Declare fixed paths such as `/users/me` before overlapping dynamic paths such as `/users/{user_id}`. Form and file parsing require `python-multipart`. `UploadFile` uses a spooled file; accepting `bytes` reads the entire upload into memory. Standard JSON bodies and multipart uploads have different encodings. [Request parameter guide](https://fastapi.tiangolo.com/tutorial/path-params/), [file uploads](https://fastapi.tiangolo.com/tutorial/request-files/)
+
+## 3. Pydantic and validation
+
+`BaseModel` defines a schema. `Field` adds constraints; `field_validator` handles custom field rules and `model_validator` handles relationships between fields. Type hints alone do not enforce runtime types in ordinary Python; Pydantic performs that validation here.
+
+- `model_dump()` produces a Python dictionary; `model_dump(mode="json")` makes values JSON-compatible.
+- `model_dump_json()` produces a JSON string.
+- `model_validate(data)` validates input and returns a model.
+- `model_copy(update=...)` does **not** validate the update data.
+- Use `ConfigDict(extra="forbid")` to reject unknown input fields.
+- Validation may coerce compatible values. Use strict types/settings if coercion is unsuitable.
+- Prefer separate create, update, and read models so clients cannot set server-controlled fields.
+
+**Required vs nullable:** `name: str | None` is required but may be null. `name: str | None = None` may be omitted and may be null. `name: str` is required and cannot be null. [Pydantic models](https://docs.pydantic.dev/latest/concepts/models/), [Pydantic fields](https://docs.pydantic.dev/latest/concepts/fields/)
+
+In this repository, PATCH allows omission of all fields but explicitly rejects null for `title` and `completed`. Null is allowed for `content` to clear it.
+
+## 4. HTTP methods and idempotency
+
+| Method | Intended operation | Safe? | Idempotent? |
+| --- | --- | --- | --- |
+| GET | Retrieve | Yes | Yes |
+| POST | Create / submit processing | No | Not generally |
+| PUT | Replace target resource | No | Yes |
+| PATCH | Apply partial changes | No | Depends on operation |
+| DELETE | Remove target resource | No | Yes |
+
+Safe means the client is not asking to change server state. Idempotent means repeating the request has the same intended effect on resource state; status codes need not match. A second DELETE may return 404 after the first returns 204. Setting a field to a fixed value can be an idempotent PATCH; incrementing a counter generally is not.
+
+For a POST that must tolerate retries, design an idempotency-key mechanism. Use plural resource names such as `/notes` and HTTP verbs for operations. [HTTP method semantics](https://www.rfc-editor.org/rfc/rfc9110.html#name-method-definitions), [PATCH specification](https://www.rfc-editor.org/rfc/rfc5789.html)
+
+## 5. PUT vs PATCH: the common interview trap
+
+PUT replaces the writable representation. This demo requires a title and resets omitted content/completed to their defaults. PATCH retains omitted fields.
+
+```python
+changes = payload.model_dump(exclude_unset=True)
+merged = {**existing.model_dump(), **changes}
+updated = NoteRead.model_validate(merged)
+```
+
+Do not use `exclude_none=True` when null means “clear this value”; it would drop that instruction. Do not use truthiness checks such as `if payload.completed` because valid values include `False`, `0`, and empty strings. Define empty PATCH behavior explicitly. This demo treats `{}` as a no-op. [FastAPI body updates](https://fastapi.tiangolo.com/tutorial/body-updates/)
+
+## 6. Response models and status codes
+
+`response_model` documents, validates, serializes, and filters output. A public model can omit internal fields such as password hashes. Returning a raw `Response` bypasses normal model processing, so construct it deliberately. Invalid response data indicates a server bug; invalid request data normally generates a 422 response. [Response models](https://fastapi.tiangolo.com/tutorial/response-model/)
+
+| Code | Typical meaning |
+| --- | --- |
+| 200 | Successful read or update |
+| 201 | Resource created |
+| 202 | Accepted for processing, not necessarily completed |
+| 204 | Successful response without a body |
+| 400 | Bad request / application-specific malformed input |
+| 401 | Missing or invalid authentication; appropriate challenge header |
+| 403 | Access forbidden |
+| 404 | Resource not found |
+| 409 | Conflict, such as duplicate unique value |
+| 422 | FastAPI's normal request validation failure |
+| 429 | Too many requests |
+| 500 | Unexpected server failure |
+
+Raise `HTTPException`, rather than returning it. Use exception handlers for consistent application error formats. Avoid catching every exception and returning 200. [Error handling](https://fastapi.tiangolo.com/tutorial/handling-errors/)
+
+## 7. `def`, `async def`, and performance
+
+Use `async def` when calling awaitable I/O clients and use `await` for their operations. Normal `def` endpoints and dependencies run in a thread pool. A normal helper called directly inside an async endpoint is **not** automatically moved to that pool.
+
+```python
+# Good with an async HTTP client:
+async def fetch_remote(client):
+    response = await client.get("https://example.com")
+    return response.status_code
+```
+
+Do not call blocking `requests.get()` or `time.sleep()` directly on the event loop. Use an async alternative or explicitly offload blocking work. Async improves concurrency while waiting for I/O; it does not accelerate CPU-heavy work. CPU-heavy jobs may need processes or external workers. Bound concurrency, use timeouts, and measure bottlenecks. [Concurrency guide](https://fastapi.tiangolo.com/async/)
+
+## 8. Dependency injection
+
+`Depends` declares reusable prerequisites such as a database session, current user, or query settings. FastAPI resolves dependencies, supports nested dependencies, and normally caches the same dependency within a request. `use_cache=False` changes that behavior. Dependencies can be sync or async.
+
+```python
+def get_settings():
+    return {"page_size": 10}
+
+@app.get("/settings-demo")
+def settings_demo(settings=Depends(get_settings)):
+    return settings
 ```
 
 A dependency using `yield` can acquire a resource and clean up in `finally`; for example, open and close a database session. Understand the configured dependency scope when resources interact with streaming responses. In tests, replace dependencies through `app.dependency_overrides`. [Dependencies](https://fastapi.tiangolo.com/tutorial/dependencies/), [sub-dependencies](https://fastapi.tiangolo.com/tutorial/dependencies/sub-dependencies/), [yield dependencies](https://fastapi.tiangolo.com/tutorial/dependencies/dependencies-with-yield/)
